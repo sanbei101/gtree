@@ -66,8 +66,13 @@ jobs:
       run: go mod tidy
 
     - name: build
-      run: go build -o btree main.go
-
+      run: go build -trimpath -ldflags="-s -w" -o btree main.go
+      env:
+        CGO_ENABLED: 0
+        GOOS: linux
+        GOARCH: amd64
+        GOAMD64: v3
+        
     - name: Create release
       uses: softprops/action-gh-release@v3
       with:
