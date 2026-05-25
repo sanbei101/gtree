@@ -2,31 +2,82 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"sync"
+
+	"github.com/spf13/cobra"
 )
 
-type Node struct {
-	Name    string
-	Files   []string
-	SubDirs []*Node
-	HasMore bool
+var (
+	maxFiles int
+	maxDepth int
+
+	rootCmd = &cobra.Command{
+		Use:   "btree [目录]",
+		Short: "以树形结构展示目录内容",
+		Long: `btree 是一个树形目录展示工具,支持限制深度和文件数量。
+
+示例:
+  btree               # 展示当前目录
+  btree /path/to/dir  # 展示指定目录
+  btree -n 10 -depth 3`,
+		Args: cobra.MaximumNArgs(1),
+		Run:  runRoot,
+	}
+
+	completionCmd = &cobra.Command{
+		Use:   "completion [bash|fish]",
+		Short: "为指定 shell 生成自动补全脚本",
+		Long: `为 btree 生成自动补全脚本。
+
+安装方法:
+
+  bash:
+    source <(btree completion bash)
+    或永久生效：btree completion bash >> ~/.bashrc
+
+  fish:
+    btree completion fish > ~/.config/fish/completions/btree.fish
+`,
+		Args:      cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		ValidArgs: []string{"bash", "fish"},
+		Run: func(cmd *cobra.Command, args []string) {
+			var err error
+			switch args[0] {
+			case "bash":
+				err = cmd.Root().GenBashCompletion(os.Stdout)
+			case "zsh":
+				err = cmd.Root().GenZshCompletion(os.Stdout)
+			case "fish":
+				err = cmd.Root().GenFishCompletion(os.Stdout, true)
+			case "powershell":
+				err = cmd.Root().GenPowerShellCompletionWithDesc(os.Stdout)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ 生成补全脚本失败: %v\n", err)
+				os.Exit(1)
+			}
+		},
+	}
+)
+
+func init() {
+	rootCmd.PersistentFlags().IntVarP(&maxFiles, "n", "n", 3, "每个文件夹最多展示的文件数量")
+	rootCmd.PersistentFlags().IntVar(&maxDepth, "depth", 5, "最大遍历深度")
+
+	rootCmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return nil, cobra.ShellCompDirectiveFilterDirs
+	}
+
+	rootCmd.AddCommand(completionCmd)
 }
 
-func main() {
-	maxFiles := flag.Int("n", 3, "每个文件夹最多展示的文件数量")
-	maxDepth := flag.Int("depth", 5, "最大遍历深度")
-	flag.Parse()
-
+func runRoot(cmd *cobra.Command, args []string) {
 	targetDir := "."
-	if flag.NArg() > 0 {
-		targetDir = flag.Arg(0)
+	if len(args) > 0 {
+		targetDir = args[0]
 	}
 
 	if targetDir == "~" {
@@ -45,7 +96,7 @@ func main() {
 	maxWorkers := runtime.NumCPU() * 4
 	sem := make(chan struct{}, maxWorkers)
 
-	rootNode := scanDirConcurrent(absPath, *maxFiles, *maxDepth, 0, sem)
+	rootNode := scanDirConcurrent(absPath, maxFiles, maxDepth, 0, sem)
 
 	writer := bufio.NewWriterSize(os.Stdout, 64*1024)
 	defer writer.Flush()
@@ -55,134 +106,8 @@ func main() {
 	}
 }
 
-func scanDirConcurrent(path string, maxFiles, maxDepth, currentDepth int, sem chan struct{}) *Node {
-	if currentDepth > maxDepth {
-		return nil
-	}
-
-	sem <- struct{}{}
-
-	f, err := os.Open(path)
-	if err != nil {
-		<-sem
-		return nil
-	}
-
-	entries, err := f.ReadDir(-1)
-	f.Close()
-	<-sem
-
-	if err != nil {
-		return nil
-	}
-
-	node := &Node{
-		Name: filepath.Base(path),
-	}
-	if node.Name == "." || node.Name == "/" || node.Name == "" {
-		node.Name = path
-	}
-
-	var dirEntries []os.DirEntry
-	var fileNames []string
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			dirEntries = append(dirEntries, entry)
-		} else {
-			fileNames = append(fileNames, entry.Name())
-		}
-	}
-
-	sort.Slice(dirEntries, func(i, j int) bool {
-		return dirEntries[i].Name() < dirEntries[j].Name()
-	})
-	sort.Strings(fileNames)
-
-	if len(fileNames) > maxFiles {
-		node.Files = fileNames[:maxFiles]
-		node.HasMore = true
-	} else {
-		node.Files = fileNames
-	}
-
-	if len(dirEntries) > 0 && currentDepth < maxDepth {
-		node.SubDirs = make([]*Node, len(dirEntries))
-		var wg sync.WaitGroup
-
-		for i, dirEntry := range dirEntries {
-			subPath := filepath.Join(path, dirEntry.Name())
-			wg.Add(1)
-
-			go func(idx int, p string) {
-				defer wg.Done()
-				node.SubDirs[idx] = scanDirConcurrent(p, maxFiles, maxDepth, currentDepth+1, sem)
-			}(i, subPath)
-		}
-		wg.Wait()
-
-		validDirs := make([]*Node, 0, len(node.SubDirs))
-		for _, sub := range node.SubDirs {
-			if sub != nil {
-				validDirs = append(validDirs, sub)
-			}
-		}
-		node.SubDirs = validDirs
-	}
-
-	return node
-}
-
-func printTree(w io.Writer, node *Node, prefix string) {
-	if node == nil {
-		return
-	}
-
-	if prefix == "" {
-		fmt.Fprintf(w, "📁 %s/\n", node.Name)
-	}
-
-	numFiles := len(node.Files)
-	numDirs := len(node.SubDirs)
-	totalItems := numFiles
-	if node.HasMore {
-		totalItems++
-	}
-	totalItems += numDirs
-
-	itemIdx := 0
-
-	for _, file := range node.Files {
-		itemIdx++
-		if itemIdx == totalItems {
-			fmt.Fprintf(w, "%s└── %s\n", prefix, file)
-		} else {
-			fmt.Fprintf(w, "%s├── %s\n", prefix, file)
-		}
-	}
-
-	if node.HasMore {
-		itemIdx++
-		if itemIdx == totalItems {
-			fmt.Fprintf(w, "%s└── ... (剩余文件已略过)\n", prefix)
-		} else {
-			fmt.Fprintf(w, "%s├── ... (剩余文件已略过)\n", prefix)
-		}
-	}
-
-	for _, subDir := range node.SubDirs {
-		itemIdx++
-		isLast := itemIdx == totalItems
-
-		var nextPrefix string
-		if isLast {
-			fmt.Fprintf(w, "%s└── %s/\n", prefix, subDir.Name)
-			nextPrefix = prefix + "    "
-		} else {
-			fmt.Fprintf(w, "%s├── %s/\n", prefix, subDir.Name)
-			nextPrefix = prefix + "│   "
-		}
-
-		printTree(w, subDir, nextPrefix)
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
