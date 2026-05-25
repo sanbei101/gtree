@@ -1,4 +1,4 @@
-name: test and benchmark
+name: test and release
 
 on:
   push:
@@ -46,3 +46,30 @@ jobs:
         echo '```' >> $GITHUB_STEP_SUMMARY
         cat benchmark-results.txt >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Setup Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: stable
+        cache: true
+
+    - name: Install dependencies
+      run: go mod tidy
+
+    - name: build
+      run: go build -o btree main.go
+
+    - name: Create release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: btree
+        name: btree
+        tag_name: release
+        make_latest: true
